@@ -217,7 +217,7 @@ void intel_detect_pch(struct drm_i915_private *dev_priv)
 	enum intel_pch pch_type;
 
     dev_priv->pch_type = PCH_NOP;
-    dev_priv->pch_id = 0;
+//    dev_priv->pch_id = 0;
     drm_dbg_kms(&dev_priv->drm, "force PCH NOP.\n");
     return;
 
