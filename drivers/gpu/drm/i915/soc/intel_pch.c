@@ -216,6 +216,11 @@ void intel_detect_pch(struct drm_i915_private *dev_priv)
 	unsigned short id;
 	enum intel_pch pch_type;
 
+    dev_priv->pch_type = PCH_NOP;
+    dev_priv->pch_id = 0;
+    drm_dbg_kms(&dev_priv->drm, "force PCH NOP.\n");
+    return;
+
 	/* DG1 has south engine display on the same PCI device */
 	if (IS_DG1(dev_priv)) {
 		dev_priv->pch_type = PCH_DG1;
