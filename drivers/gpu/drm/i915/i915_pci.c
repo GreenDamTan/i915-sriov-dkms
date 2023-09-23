@@ -990,6 +990,7 @@ static const struct intel_device_info dg1_info = {
 		BIT(VCS0) | BIT(VCS2),
 	/* Wa_16011227922 */
 	.__runtime.ppgtt_size = 47,
+    .has_sriov = 1,
 };
 
 static const struct intel_device_info adl_s_info = {
