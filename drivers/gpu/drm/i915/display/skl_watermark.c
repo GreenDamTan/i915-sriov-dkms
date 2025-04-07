@@ -36,6 +36,11 @@
 #include "skl_watermark.h"
 #include "skl_watermark_regs.h"
 
+#ifdef I915
+#include "../i915_drv.h"
+#include "../i915_vgpu.h"
+#endif
+
 struct intel_dbuf_state {
 	struct intel_global_state base;
 
@@ -145,7 +150,13 @@ static void intel_sagv_init(struct intel_display *display)
 	if (DISPLAY_VER(display) < 11)
 		skl_sagv_disable(display);
 
+#ifdef I915
+	if (!intel_vgpu_active(to_i915(display->drm)))
+		drm_WARN_ON(display->drm,
+			    display->sagv.status == I915_SAGV_UNKNOWN);
+#else
 	drm_WARN_ON(display->drm, display->sagv.status == I915_SAGV_UNKNOWN);
+#endif
 
 	display->sagv.block_time_us = intel_sagv_block_time(display);
 

@@ -49,6 +49,11 @@ static enum skl_power_gate pw_idx_to_pg(struct intel_display *display, int pw_id
 	return pw_idx - pw1_idx + SKL_PG1;
 }
 
+#ifdef I915
+#include "../i915_drv.h"
+#include "../i915_vgpu.h"
+#endif
+
 struct i915_power_well_regs {
 	i915_reg_t bios;
 	i915_reg_t driver;
@@ -373,6 +378,11 @@ static void hsw_wait_for_power_well_disable(struct intel_display *display,
 static void gen9_wait_for_power_well_fuses(struct intel_display *display,
 					   enum skl_power_gate pg)
 {
+#ifdef I915
+	if (intel_vgpu_active(to_i915(display->drm)))
+		return;
+#endif
+
 	/* Timeout 5us for PG#0, for other PGs 1us */
 	drm_WARN_ON(display->drm,
 		    intel_de_wait_for_set_ms(display, SKL_FUSE_STATUS,
