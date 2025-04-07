@@ -28,6 +28,8 @@
 #include "skl_watermark.h"
 #include "skl_watermark_regs.h"
 
+#include "i915_vgpu.h"
+
 /*It is expected that DSB can do posted writes to every register in
  * the pipe and planes within 100us. For flip queue use case, the
  * recommended DSB execution time is 100us + one SAGV block time.
@@ -124,7 +126,9 @@ static void intel_sagv_init(struct drm_i915_private *i915)
 	if (DISPLAY_VER(i915) < 11)
 		skl_sagv_disable(i915);
 
+    if (!intel_vgpu_active(i915)) {
 	drm_WARN_ON(&i915->drm, i915->display.sagv.status == I915_SAGV_UNKNOWN);
+    }
 
 	i915->display.sagv.block_time_us = intel_sagv_block_time(i915);
 
