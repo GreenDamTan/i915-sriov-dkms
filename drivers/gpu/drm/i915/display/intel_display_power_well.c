@@ -419,6 +419,9 @@ static void hsw_wait_for_power_well_disable(struct intel_display *display,
 static void gen9_wait_for_power_well_fuses(struct intel_display *display,
 					   enum skl_power_gate pg)
 {
+	if (intel_parent_vgpu_active(display))
+		return;
+
 	/* Timeout 5us for PG#0, for other PGs 1us */
 	drm_WARN_ON(display->drm,
 		    intel_de_wait_for_set_ms(display, SKL_FUSE_STATUS,

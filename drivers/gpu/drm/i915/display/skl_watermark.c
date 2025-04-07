@@ -144,7 +144,8 @@ static void intel_sagv_init(struct intel_display *display)
 	if (DISPLAY_VER(display) < 11)
 		skl_sagv_disable(display);
 
-	drm_WARN_ON(display->drm, display->sagv.status == I915_SAGV_UNKNOWN);
+	if (!intel_parent_vgpu_active(display))
+		drm_WARN_ON(display->drm, display->sagv.status == I915_SAGV_UNKNOWN);
 
 	display->sagv.block_time_us = intel_sagv_block_time(display);
 
