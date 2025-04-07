@@ -677,7 +677,7 @@ static const struct intel_device_info dg1_info = {
 	DGFX_FEATURES,
 	.__runtime.graphics.ip.rel = 10,
 	PLATFORM(INTEL_DG1),
-	.require_force_probe = 1,
+	/*.require_force_probe = 1,*/
 	.__runtime.platform_engine_mask =
 		BIT(RCS0) | BIT(BCS0) | BIT(VECS0) |
 		BIT(VCS0) | BIT(VCS2),
@@ -761,7 +761,7 @@ static const struct intel_device_info dg2_info = {
 
 static const struct intel_device_info ats_m_info = {
 	DG2_FEATURES,
-	.require_force_probe = 1,
+	/*.require_force_probe = 1,*/
 	.tuning_thread_rr_after_dep = 1,
 };
 
@@ -799,7 +799,7 @@ static const struct intel_device_info mtl_info = {
 	.has_pxp = 1,
 	.__runtime.memory_regions = BIT(INTEL_REGION_SMEM) | BIT(INTEL_REGION_STOLEN_LMEM),
 	.__runtime.platform_engine_mask = BIT(RCS0) | BIT(BCS0) | BIT(CCS0),
-	.require_force_probe = 1,
+	/*.require_force_probe = 1,*/
 	MTL_CACHELEVEL,
 };
 
