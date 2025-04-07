@@ -23,6 +23,8 @@
 #include "i915_drv.h"
 #include "i915_hwmon.h"
 
+#include "i915_vgpu.h"
+
 static const struct intel_uc_ops uc_ops_off;
 static const struct intel_uc_ops uc_ops_on;
 static const struct intel_uc_ops uc_ops_vf;
@@ -30,6 +32,11 @@ static const struct intel_uc_ops uc_ops_vf;
 static void uc_expand_default_options(struct intel_uc *uc)
 {
 	struct drm_i915_private *i915 = uc_to_gt(uc)->i915;
+
+    if (intel_vgpu_active(i915)) {
+        i915->params.enable_guc = 0;
+        return;
+    }
 
 	if (i915->params.enable_guc != -1)
 		return;
