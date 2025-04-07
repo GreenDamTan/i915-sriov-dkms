@@ -31,6 +31,8 @@
 #include "vlv_sideband.h"
 #include "vlv_sideband_reg.h"
 
+#include "i915_vgpu.h"
+
 struct i915_power_well_regs {
 	i915_reg_t bios;
 	i915_reg_t driver;
@@ -333,6 +335,9 @@ static void hsw_wait_for_power_well_disable(struct drm_i915_private *dev_priv,
 static void gen9_wait_for_power_well_fuses(struct drm_i915_private *dev_priv,
 					   enum skl_power_gate pg)
 {
+    if (intel_vgpu_active(dev_priv)) {
+        return;
+    }
 	/* Timeout 5us for PG#0, for other PGs 1us */
 	drm_WARN_ON(&dev_priv->drm,
 		    intel_de_wait_for_set(dev_priv, SKL_FUSE_STATUS,
