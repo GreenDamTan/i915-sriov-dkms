@@ -149,7 +149,11 @@ err_mmio:
 
 static void intel_gvt_init_device(struct drm_i915_private *dev_priv)
 {
-	if (!dev_priv->params.enable_gvt) {
+	if (is_supported_device(dev_priv) && dev_priv->params.enable_gvt == -6 && !intel_vgpu_active(dev_priv) ) {
+        dev_priv->params.enable_gvt = 1;
+	}
+
+	if (dev_priv->params.enable_gvt <= 0) {
 		drm_dbg(&dev_priv->drm,
 			"GVT-g is disabled by kernel params\n");
 		return;
