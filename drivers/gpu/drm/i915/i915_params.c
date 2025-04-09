@@ -118,8 +118,8 @@ i915_param_named_unsafe(gsc_firmware_path, charp, 0400,
 	"GSC firmware path to use instead of the default one");
 
 #if IS_ENABLED(CONFIG_DRM_I915_GVT)
-i915_param_named(enable_gvt, bool, 0400,
-	"Enable support for Intel GVT-g graphics virtualization host support(default:false)");
+i915_param_named(enable_gvt, int, 0400,
+	"Enable GVT-g host support (-6=auto on supported hosts [default], 0=disable, 1=enable)");
 #endif
 
 #if CONFIG_DRM_I915_REQUEST_TIMEOUT
