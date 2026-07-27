@@ -41,6 +41,11 @@ static void uc_expand_default_options(struct intel_uc *uc)
 	if (i915->params.enable_guc != -1)
 		return;
 
+    if (IS_GEMINILAKE(i915) || IS_JASPERLAKE(i915) ||
+        IS_ELKHARTLAKE(i915)) {
+        i915->params.enable_guc = ENABLE_GUC_LOAD_HUC;
+        return;
+    }
 	/* Don't enable GuC/HuC on pre-Gen12 */
 	if (GRAPHICS_VER(i915) < 12) {
 		i915->params.enable_guc = 0;
