@@ -52,13 +52,16 @@ intel_iommu=on xe.max_vfs=7 xe.force_probe=${device_id} module_blacklist=i915
 
 ---
 
-#### 🚨 Important Update for Xe_LP Platforms (TGL / ADL / RPL)
+#### Xe_LP CCS Defaults (TGL / ADL / RPL)
 
-Starting from version **2026.09.16**, `CCS0` is **no longer enabled by default** on Xe_LP platforms. 
+This branch enables `CCS0` by default on Xe_LP platforms in both the `i915` and `xe` drivers (`xelp_enable_ccs=1`). This supports Windows guest initialization and compatibility with older Linux guest drivers that expect CCS, as described in [issue #498](https://github.com/strongtz/i915-sriov-dkms/issues/498).
 
-If you encounter issues running **Windows guest VMs**, please append the appropriate parameter to your kernel command line:
-* **For i915 driver:** `i915.xelp_enable_ccs=1`
-* **For xe driver:** `xe.xelp_enable_ccs=1`
+To disable experimental CCS support, set the corresponding kernel parameter:
+
+* **For i915 driver:** `i915.xelp_enable_ccs=0`
+* **For xe driver:** `xe.xelp_enable_ccs=0`
+
+If a guest requires CCS, keep it enabled on the host.
 
 ## Manually create Virtual Functions (VFs)
 
