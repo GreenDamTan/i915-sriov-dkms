@@ -64,6 +64,7 @@ struct drm_printer;
 	param(unsigned int, max_vfs, 7, 0400) \
 	param(unsigned long, vfs_flr_mask, ~0, IS_ENABLED(CONFIG_DRM_I915_DEBUG_IOV) ? 0600 : 0) \
 	/* leave bools at the end to not create holes */ \
+	param(bool, enable_vf_pmu, true, 0400) \
 	param(bool, enable_hangcheck, true, 0600) \
 	param(bool, error_capture, true, IS_ENABLED(CONFIG_DRM_I915_CAPTURE_ERROR) ? 0600 : 0) \
 	param(bool, enable_debug_only_api, false, IS_ENABLED(CONFIG_DRM_I915_REPLAY_GPU_HANGS_API) ? 0400 : 0) \

@@ -8,6 +8,7 @@
 
 #include <drm/drm_print.h>
 
+#include "gt/intel_context.h"
 #include "gt/intel_engine.h"
 #include "gt/intel_engine_pm.h"
 #include "gt/intel_engine_regs.h"
@@ -38,6 +39,30 @@ static struct i915_pmu *event_to_pmu(struct perf_event *event)
 static struct drm_i915_private *pmu_to_i915(struct i915_pmu *pmu)
 {
 	return container_of(pmu, struct drm_i915_private, pmu);
+}
+
+static bool pmu_has_device_name(struct drm_i915_private *i915)
+{
+	/* Match the PCI-address naming used by intel_gpu_top in a guest. */
+	if (IS_SRIOV_VF(i915))
+		return strcmp(dev_name(i915->drm.dev), "0000:00:02.0");
+
+	return IS_DGFX(i915);
+}
+
+bool i915_pmu_is_vf_software(struct drm_i915_private *i915)
+{
+	return IS_SRIOV_VF(i915) && i915->params.enable_vf_pmu;
+}
+
+void i915_pmu_account_vf_runtime(struct intel_context *ce, u64 ticks)
+{
+	struct drm_i915_private *i915 = ce->engine->i915;
+	unsigned int class = ce->engine->uabi_class;
+
+	if (class < ARRAY_SIZE(i915->pmu.vf_runtime))
+		atomic64_add(ticks * ce->engine->gt->clock_period_ns,
+			     &i915->pmu.vf_runtime[class]);
 }
 
 static u8 engine_config_sample(u64 config)
@@ -152,6 +177,9 @@ static bool pmu_needs_timer(struct i915_pmu *pmu)
 {
 	struct drm_i915_private *i915 = pmu_to_i915(pmu);
 	u32 enable;
+
+	if (IS_SRIOV_VF(i915))
+		return false;
 
 	/*
 	 * Only some counters need the sampling timer.
@@ -301,7 +329,7 @@ void i915_pmu_gt_parked(struct intel_gt *gt)
 {
 	struct i915_pmu *pmu = &gt->i915->pmu;
 
-	if (!pmu->registered)
+	if (!pmu->registered || IS_SRIOV_VF(gt->i915))
 		return;
 
 	spin_lock_irq(&pmu->lock);
@@ -323,7 +351,7 @@ void i915_pmu_gt_unparked(struct intel_gt *gt)
 {
 	struct i915_pmu *pmu = &gt->i915->pmu;
 
-	if (!pmu->registered)
+	if (!pmu->registered || IS_SRIOV_VF(gt->i915))
 		return;
 
 	spin_lock_irq(&pmu->lock);
@@ -552,6 +580,13 @@ static int
 engine_event_status(struct intel_engine_cs *engine,
 		    enum drm_i915_pmu_engine_sample sample)
 {
+	if (IS_SRIOV_VF(engine->i915)) {
+		/* A load-balanced context cannot identify a physical engine. */
+		if (sample != I915_SAMPLE_BUSY || engine->uabi_instance)
+			return -ENOENT;
+		return 0;
+	}
+
 	switch (sample) {
 	case I915_SAMPLE_BUSY:
 	case I915_SAMPLE_WAIT:
@@ -574,6 +609,9 @@ config_status(struct drm_i915_private *i915, u64 config)
 
 	unsigned int gt_id = config_gt_id(config);
 	unsigned int max_gt_id = HAS_EXTRA_GT_LIST(i915) ? 1 : 0;
+
+	if (IS_SRIOV_VF(i915))
+		return !gt_id && config == I915_PMU_INTERRUPTS ? 0 : -ENOENT;
 
 	if (gt_id > max_gt_id)
 		return -ENOENT;
@@ -672,6 +710,11 @@ static u64 __i915_pmu_event_read(struct perf_event *event)
 
 		if (drm_WARN_ON_ONCE(&i915->drm, !engine)) {
 			/* Do nothing */
+		} else if (IS_SRIOV_VF(i915)) {
+			unsigned int class = engine->uabi_class;
+
+			val = div_u64(atomic64_read(&pmu->vf_runtime[class]),
+				      i915->engine_uabi_class_count[class]);
 		} else if (sample == I915_SAMPLE_BUSY &&
 			   intel_engine_supports_stats(engine)) {
 			ktime_t unused;
@@ -916,6 +959,18 @@ static const struct attribute_group i915_pmu_format_attr_group = {
 	.attrs = i915_pmu_format_attrs,
 };
 
+static struct attribute *i915_vf_pmu_caps_attrs[] = {
+	I915_PMU_FORMAT_ATTR(software, "1"),
+	I915_PMU_FORMAT_ATTR(busy_aggregation, "class-average"),
+	I915_PMU_FORMAT_ATTR(sampling_period_ms, __stringify(I915_VF_PMU_POLL_MS)),
+	NULL,
+};
+
+static const struct attribute_group i915_vf_pmu_caps_attr_group = {
+	.name = "caps",
+	.attrs = i915_vf_pmu_caps_attrs,
+};
+
 struct i915_ext_attribute {
 	struct device_attribute attr;
 	unsigned long val;
@@ -1152,20 +1207,22 @@ void i915_pmu_register(struct drm_i915_private *i915)
 	const struct attribute_group *attr_groups[] = {
 		&i915_pmu_format_attr_group,
 		&pmu->events_attr_group,
+		IS_SRIOV_VF(i915) ? &i915_vf_pmu_caps_attr_group : NULL,
 		NULL
 	};
 	int ret = -ENOMEM;
 
-	if (IS_SRIOV_VF(i915)) {
+	if (IS_SRIOV_VF(i915) && !i915_pmu_is_vf_software(i915)) {
 		drm_info(&i915->drm, "PMU not supported for this GPU.");
 		return;
 	}
 
 	spin_lock_init(&pmu->lock);
 	hrtimer_setup(&pmu->timer, i915_sample, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	init_rc6(pmu);
+	if (!IS_SRIOV_VF(i915))
+		init_rc6(pmu);
 
-	if (IS_DGFX(i915)) {
+	if (pmu_has_device_name(i915)) {
 		pmu->name = kasprintf(GFP_KERNEL,
 				      "i915_%s",
 				      dev_name(i915->drm.dev));
@@ -1205,6 +1262,10 @@ void i915_pmu_register(struct drm_i915_private *i915)
 
 	pmu->registered = true;
 
+	if (IS_SRIOV_VF(i915))
+		drm_info(&i915->drm,
+			 "Software VF PMU enabled: class-average context runtime, not hardware engine counters\n");
+
 	return;
 
 err_groups:
@@ -1212,7 +1273,7 @@ err_groups:
 err_attr:
 	free_event_attributes(pmu);
 err_name:
-	if (IS_DGFX(i915))
+	if (pmu_has_device_name(i915))
 		kfree(pmu->name);
 err:
 	drm_notice(&i915->drm, "Failed to register PMU!\n");
@@ -1232,7 +1293,7 @@ void i915_pmu_unregister(struct drm_i915_private *i915)
 
 	perf_pmu_unregister(&pmu->base);
 	kfree(pmu->base.attr_groups);
-	if (IS_DGFX(i915))
+	if (pmu_has_device_name(i915))
 		kfree(pmu->name);
 	free_event_attributes(pmu);
 }

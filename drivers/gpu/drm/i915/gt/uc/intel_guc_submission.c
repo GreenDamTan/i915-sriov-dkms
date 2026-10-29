@@ -27,6 +27,7 @@
 
 #include "i915_drv.h"
 #include "i915_irq.h"
+#include "i915_pmu.h"
 #include "i915_reg.h"
 #include "i915_trace.h"
 #include "i915_wait_util.h"
@@ -1493,7 +1494,14 @@ static void __guc_context_update_stats(struct intel_context *ce)
 	unsigned long flags;
 
 	spin_lock_irqsave(&guc->timestamp.lock, flags);
-	lrc_update_runtime(ce);
+	if (i915_pmu_is_vf_software(ce->engine->i915)) {
+		u64 previous = ce->stats.runtime.total;
+
+		lrc_update_runtime(ce);
+		i915_pmu_account_vf_runtime(ce, ce->stats.runtime.total - previous);
+	} else {
+		lrc_update_runtime(ce);
+	}
 	spin_unlock_irqrestore(&guc->timestamp.lock, flags);
 }
 
@@ -1504,6 +1512,25 @@ static void guc_context_update_stats(struct intel_context *ce)
 
 	__guc_context_update_stats(ce);
 	intel_context_unpin(ce);
+}
+
+static void guc_update_vf_context_stats(struct intel_guc *guc)
+{
+	struct intel_context *ce;
+	unsigned long index, flags;
+
+	/* Contexts can be deregistered while the software PMU is sampling. */
+	xa_lock_irqsave(&guc->context_lookup, flags);
+	xa_for_each(&guc->context_lookup, index, ce) {
+		if (!kref_get_unless_zero(&ce->ref))
+			continue;
+
+		xa_unlock_irqrestore(&guc->context_lookup, flags);
+		guc_context_update_stats(ce);
+		intel_context_put(ce);
+		xa_lock_irqsave(&guc->context_lookup, flags);
+	}
+	xa_unlock_irqrestore(&guc->context_lookup, flags);
 }
 
 static void guc_timestamp_ping(struct work_struct *wrk)
@@ -1557,11 +1584,15 @@ static void guc_timestamp_ping(struct work_struct *wrk)
 	if (ret)
 		goto err_trylock;
 
-	__update_guc_busyness_stats(guc);
+	if (IS_SRIOV_VF(gt->i915)) {
+		guc_update_vf_context_stats(guc);
+	} else {
+		__update_guc_busyness_stats(guc);
 
-	/* adjust context stats for overflow */
-	xa_for_each(&guc->context_lookup, index, ce)
-		guc_context_update_stats(ce);
+		/* adjust context stats for overflow */
+		xa_for_each(&guc->context_lookup, index, ce)
+			guc_context_update_stats(ce);
+	}
 
 	intel_gt_reset_unlock(gt, srcu);
 
@@ -1615,11 +1646,14 @@ void intel_guc_busyness_park(struct intel_gt *gt)
 {
 	struct intel_guc *guc = gt_to_guc(gt);
 
-	if (IS_SRIOV_VF(gt->i915))
-		return;
-
 	if (!guc_submission_initialized(guc))
 		return;
+
+	if (IS_SRIOV_VF(gt->i915)) {
+		if (i915_pmu_is_vf_software(gt->i915))
+			guc_cancel_busyness_worker(guc);
+		return;
+	}
 
 	/* Assume no engines are running and set running state to false */
 	__update_guc_busyness_running_state(guc);
@@ -1650,11 +1684,14 @@ void intel_guc_busyness_unpark(struct intel_gt *gt)
 	unsigned long flags;
 	ktime_t unused;
 
-	if (IS_SRIOV_VF(gt->i915))
-		return;
-
 	if (!guc_submission_initialized(guc))
 		return;
+
+	if (IS_SRIOV_VF(gt->i915)) {
+		if (i915_pmu_is_vf_software(gt->i915))
+			guc_enable_busyness_worker(guc);
+		return;
+	}
 
 	spin_lock_irqsave(&guc->timestamp.lock, flags);
 	guc_update_pm_timestamp(guc, &unused);
@@ -1723,6 +1760,9 @@ void intel_guc_submission_reset_prepare(struct intel_guc *guc)
 		/* Reset called during driver load? GuC not yet initialised! */
 		return;
 	}
+
+	if (i915_pmu_is_vf_software(guc_to_gt(guc)->i915))
+		guc_cancel_busyness_worker(guc);
 
 	intel_gt_park_heartbeats(guc_to_gt(guc));
 	disable_submission(guc);
@@ -2270,6 +2310,8 @@ int intel_guc_submission_init(struct intel_guc *guc)
 	}
 
 	guc->timestamp.ping_delay = (POLL_TIME_CLKS / gt->clock_frequency + 1) * HZ;
+	if (i915_pmu_is_vf_software(gt->i915))
+		guc->timestamp.ping_delay = msecs_to_jiffies(I915_VF_PMU_POLL_MS);
 	guc->timestamp.shift = gpm_timestamp_shift(gt);
 	guc->submission_initialized = true;
 
@@ -5022,6 +5064,8 @@ int intel_guc_submission_enable(struct intel_guc *guc)
 		ret = guc_init_engine_stats(guc);
 		if (ret)
 			goto fail_sem;
+	} else if (i915_pmu_is_vf_software(guc_to_gt(guc)->i915)) {
+		guc_enable_busyness_worker(guc);
 	}
 
 	ret = guc_init_global_schedule_policy(guc);

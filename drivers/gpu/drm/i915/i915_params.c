@@ -72,6 +72,9 @@ i915_param_named_unsafe(reset, uint, 0400,
 i915_param_named(max_vfs, uint, 0400,
 	"Limit number of virtual functions (0=none, N=allow up to N VFs [default: 7])");
 
+i915_param_named_unsafe(enable_vf_pmu, bool, 0400,
+			"Enable a software PMU for SR-IOV VFs using context runtime (default: true)");
+
 #if IS_ENABLED(CONFIG_DRM_I915_CAPTURE_ERROR)
 i915_param_named(error_capture, bool, 0400,
 	"Record the GPU state following a hang. "

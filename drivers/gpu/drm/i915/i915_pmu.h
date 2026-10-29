@@ -7,13 +7,17 @@
 #ifndef __I915_PMU_H__
 #define __I915_PMU_H__
 
+#include <linux/atomic.h>
 #include <linux/hrtimer.h>
 #include <linux/perf_event.h>
 #include <linux/spinlock_types.h>
 #include <uapi/drm/i915_drm.h>
 
 struct drm_i915_private;
+struct intel_context;
 struct intel_gt;
+
+#define I915_VF_PMU_POLL_MS 20
 
 /*
  * Non-engine events that we need to track enabled-disabled transition and
@@ -134,6 +138,13 @@ struct i915_pmu {
 	 */
 	unsigned long irq_count;
 	/**
+	 * @vf_runtime: Context runtime in nanoseconds, accumulated by engine class.
+	 *
+	 * The VF software PMU reports each class's average engine time.
+	 * GuC context stats serialization ensures each runtime delta is added once.
+	 */
+	atomic64_t vf_runtime[I915_ENGINE_CLASS_COMPUTE + 1];
+	/**
 	 * @events_attr_group: Device events attribute group.
 	 */
 	struct attribute_group events_attr_group;
@@ -148,11 +159,19 @@ struct i915_pmu {
 };
 
 #ifdef CONFIG_PERF_EVENTS
+bool i915_pmu_is_vf_software(struct drm_i915_private *i915);
+void i915_pmu_account_vf_runtime(struct intel_context *ce, u64 ticks);
 void i915_pmu_register(struct drm_i915_private *i915);
 void i915_pmu_unregister(struct drm_i915_private *i915);
 void i915_pmu_gt_parked(struct intel_gt *gt);
 void i915_pmu_gt_unparked(struct intel_gt *gt);
 #else
+static inline bool i915_pmu_is_vf_software(struct drm_i915_private *i915)
+{
+	return false;
+}
+
+static inline void i915_pmu_account_vf_runtime(struct intel_context *ce, u64 ticks) {}
 static inline void i915_pmu_register(struct drm_i915_private *i915) {}
 static inline void i915_pmu_unregister(struct drm_i915_private *i915) {}
 static inline void i915_pmu_gt_parked(struct intel_gt *gt) {}

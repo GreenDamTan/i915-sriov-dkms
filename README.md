@@ -63,6 +63,15 @@ To disable experimental CCS support, set the corresponding kernel parameter:
 
 If a guest requires CCS, keep it enabled on the host.
 
+#### i915 VF software PMU
+
+This branch enables the i915 VF software PMU by default. Guests expose context
+runtime through the standard i915 perf interface with an unmodified host
+driver. It reports average busy time per engine class and VF interrupt counts,
+with no hardware frequency or RC6 data.
+To disable it, set `i915.enable_vf_pmu=0` in the guest.
+See [VF software PMU setup and limitations](docs/vf-software-pmu.md).
+
 ## Manually create Virtual Functions (VFs)
 
 ```
