@@ -72,6 +72,26 @@ with no hardware frequency or RC6 data.
 To disable it, set `i915.enable_vf_pmu=0` in the guest.
 See [VF software PMU setup and limitations](docs/vf-software-pmu.md).
 
+#### i915 hwmon temperature
+
+Supported physical i915 GPUs expose `temp1_input` under their PCI device's
+`hwmon/hwmon*` directory, in millidegrees Celsius:
+
+* Haswell, Broadwell, Skylake, Kaby Lake, Coffee Lake, and Comet Lake use the
+  package temperature register.
+* Gemini Lake uses its signed PKGT package temperature field. This measures
+  the shared SoC temperature.
+* Ice Lake, Tiger Lake, Rocket Lake, Alder Lake, and Meteor Lake use the GT
+  thermal status register and the CPU's TjMax value.
+
+The GT temperature path requires the running kernel to provide
+`CONFIG_INTEL_TCC=y` or `m`. DKMS does not enable kernel configuration options;
+without Intel TCC, these GT sensors are omitted while package sensors remain
+available. Invalid register readings report the sensor as unavailable.
+
+Integrated GPUs expose only temperature through this interface. Discrete GPUs
+keep their existing hwmon controls, and SR-IOV VFs do not register hwmon.
+
 ## Manually create Virtual Functions (VFs)
 
 ```

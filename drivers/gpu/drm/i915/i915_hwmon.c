@@ -5,6 +5,7 @@
 
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
+#include <linux/intel_tcc.h>
 #include <linux/jiffies.h>
 #include <linux/types.h>
 #include <linux/units.h>
@@ -36,6 +37,7 @@
 struct hwm_reg {
 	i915_reg_t gt_perf_status;
 	i915_reg_t pkg_temp;
+	i915_reg_t gt_temp;
 	i915_reg_t pkg_power_sku_unit;
 	i915_reg_t pkg_power_sku;
 	i915_reg_t pkg_rapl_limit;
@@ -320,7 +322,9 @@ hwm_temp_is_visible(const struct hwm_drvdata *ddat, u32 attr)
 {
 	struct i915_hwmon *hwmon = ddat->hwmon;
 
-	if (attr == hwmon_temp_input && i915_mmio_reg_valid(hwmon->rg.pkg_temp))
+	if (attr == hwmon_temp_input &&
+	    (i915_mmio_reg_valid(hwmon->rg.pkg_temp) ||
+	     i915_mmio_reg_valid(hwmon->rg.gt_temp)))
 		return 0444;
 
 	return 0;
@@ -332,14 +336,49 @@ hwm_temp_read(struct hwm_drvdata *ddat, u32 attr, long *val)
 	struct i915_hwmon *hwmon = ddat->hwmon;
 	intel_wakeref_t wakeref;
 	u32 reg_val;
+	int tjmax, temp_offset;
 
 	switch (attr) {
 	case hwmon_temp_input:
-		with_intel_runtime_pm(ddat->uncore->rpm, wakeref)
-			reg_val = intel_uncore_read(ddat->uncore, hwmon->rg.pkg_temp);
+		if (i915_mmio_reg_valid(hwmon->rg.pkg_temp)) {
+			with_intel_runtime_pm(ddat->uncore->rpm, wakeref)
+				reg_val = intel_uncore_read(ddat->uncore,
+							    hwmon->rg.pkg_temp);
 
-		/* HW register value is in degrees Celsius, convert to millidegrees. */
-		*val = REG_FIELD_GET(TEMP_MASK, reg_val) * MILLIDEGREE_PER_DEGREE;
+			if (reg_val == U32_MAX)
+				return -ENODATA;
+
+			if (IS_GEMINILAKE(ddat->uncore->i915)) {
+				*val = (s8)REG_FIELD_GET(GLK_TEMP_MASK, reg_val) *
+					MILLIDEGREE_PER_DEGREE;
+				return 0;
+			}
+
+			/* Package register reports absolute degrees Celsius. */
+			*val = REG_FIELD_GET(TEMP_MASK, reg_val) *
+				MILLIDEGREE_PER_DEGREE;
+			return 0;
+		}
+
+		/* DKMS cannot enable an absent host-kernel TCC library. */
+		if (!IS_REACHABLE(CONFIG_INTEL_TCC))
+			return -ENODEV;
+
+		with_intel_runtime_pm(ddat->uncore->rpm, wakeref)
+			reg_val = intel_uncore_read(ddat->uncore, hwmon->rg.gt_temp);
+
+		if (reg_val == U32_MAX || !(reg_val & GEN12_THERM_STATUS_GT_VALID))
+			return -ENODATA;
+
+		tjmax = intel_tcc_get_tjmax(-1);
+		if (tjmax < 0)
+			return tjmax;
+
+		temp_offset = REG_FIELD_GET(GEN12_THERM_STATUS_GT_TEMP, reg_val);
+		if (!tjmax || temp_offset > tjmax)
+			return -ERANGE;
+
+		*val = (tjmax - temp_offset) * MILLIDEGREE_PER_DEGREE;
 		return 0;
 	default:
 		return -EOPNOTSUPP;
@@ -727,6 +766,10 @@ hwm_is_visible(const void *drvdata, enum hwmon_sensor_types type,
 {
 	struct hwm_drvdata *ddat = (struct hwm_drvdata *)drvdata;
 
+	/* Integrated platforms expose temperature without PCODE power controls. */
+	if (!IS_DGFX(ddat->uncore->i915) && type != hwmon_temp)
+		return 0;
+
 	switch (type) {
 	case hwmon_temp:
 		return hwm_temp_is_visible(ddat, attr);
@@ -834,6 +877,22 @@ static const struct hwmon_chip_info hwm_gt_chip_info = {
 	.info = hwm_gt_info,
 };
 
+static bool hwm_igfx_supports_pkg_temp(struct drm_i915_private *i915)
+{
+	return IS_HASWELL(i915) || IS_BROADWELL(i915) ||
+	       IS_GEMINILAKE(i915) || IS_SKYLAKE(i915) ||
+	       IS_KABYLAKE(i915) || IS_COFFEELAKE(i915) ||
+	       IS_COMETLAKE(i915);
+}
+
+static bool hwm_igfx_supports_gt_temp(struct drm_i915_private *i915)
+{
+	return IS_REACHABLE(CONFIG_INTEL_TCC) &&
+	       (IS_ICELAKE(i915) || IS_TIGERLAKE(i915) ||
+		IS_ROCKETLAKE(i915) || IS_ALDERLAKE_S(i915) ||
+		IS_ALDERLAKE_P(i915) || IS_METEORLAKE(i915));
+}
+
 static void
 hwm_get_preregistration_info(struct drm_i915_private *i915)
 {
@@ -851,6 +910,7 @@ hwm_get_preregistration_info(struct drm_i915_private *i915)
 
 	if (IS_DG1(i915) || IS_DG2(i915)) {
 		hwmon->rg.pkg_temp = PCU_PACKAGE_TEMPERATURE;
+		hwmon->rg.gt_temp = INVALID_MMIO_REG;
 		hwmon->rg.pkg_power_sku_unit = PCU_PACKAGE_POWER_SKU_UNIT;
 		hwmon->rg.pkg_power_sku = PCU_PACKAGE_POWER_SKU;
 		hwmon->rg.pkg_rapl_limit = PCU_PACKAGE_RAPL_LIMIT;
@@ -858,7 +918,13 @@ hwm_get_preregistration_info(struct drm_i915_private *i915)
 		hwmon->rg.energy_status_tile = INVALID_MMIO_REG;
 		hwmon->rg.fan_speed = PCU_PWM_FAN_SPEED;
 	} else {
-		hwmon->rg.pkg_temp = INVALID_MMIO_REG;
+		if (IS_GEMINILAKE(i915))
+			hwmon->rg.pkg_temp = GLK_PCU_PACKAGE_TEMPERATURE;
+		else
+			hwmon->rg.pkg_temp = hwm_igfx_supports_pkg_temp(i915) ?
+				PCU_PACKAGE_TEMPERATURE : INVALID_MMIO_REG;
+		hwmon->rg.gt_temp = hwm_igfx_supports_gt_temp(i915) ?
+			GEN12_THERM_STATUS_GT : INVALID_MMIO_REG;
 		hwmon->rg.pkg_power_sku_unit = INVALID_MMIO_REG;
 		hwmon->rg.pkg_power_sku = INVALID_MMIO_REG;
 		hwmon->rg.pkg_rapl_limit = INVALID_MMIO_REG;
@@ -913,8 +979,12 @@ void i915_hwmon_register(struct drm_i915_private *i915)
 	struct intel_gt *gt;
 	int i;
 
-	/* hwmon is available only for dGfx */
-	if (!IS_DGFX(i915))
+	if (IS_SRIOV_VF(i915))
+		return;
+
+	/* Selected iGfx platforms expose package or GT temperature only. */
+	if (!IS_DGFX(i915) && !hwm_igfx_supports_pkg_temp(i915) &&
+	    !hwm_igfx_supports_gt_temp(i915))
 		return;
 
 	hwmon = kzalloc_obj(*hwmon);
