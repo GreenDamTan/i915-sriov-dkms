@@ -64,6 +64,11 @@ struct xe_lrc {
 	/** @ctx_timestamp: readout value of CTX_TIMESTAMP on last update */
 	u64 ctx_timestamp;
 
+#if IS_ENABLED(CONFIG_PERF_EVENTS)
+	/** @vf_pmu_timestamp: Last VF PMU sample, under the GuC submission lock. */
+	u32 vf_pmu_timestamp;
+#endif
+
 	/** @queue_timestamp: value of QUEUE_TIMESTAMP on last update */
 	u64 queue_timestamp;
 

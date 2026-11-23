@@ -26,6 +26,7 @@ struct xe_modparam {
 	unsigned int wedged_mode;
 	u32 svm_notifier_size;
 	bool xelp_enable_ccs;
+	bool enable_vf_pmu;
 };
 
 extern struct xe_modparam xe_modparam;

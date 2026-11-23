@@ -40,6 +40,7 @@
 #include "xe_mocs.h"
 #include "xe_module.h"
 #include "xe_pm.h"
+#include "xe_pmu.h"
 #include "xe_ring_ops_types.h"
 #include "xe_sched_job.h"
 #include "xe_sleep.h"
@@ -396,6 +397,7 @@ static void __release_guc_id(struct xe_guc *guc, struct xe_exec_queue *q,
 
 	mutex_lock(&guc->submission_state.lock);
 
+	xe_pmu_vf_queue_fini(q);
 	for (i = 0; i < count; ++i)
 		xa_erase(&guc->submission_state.exec_queue_lookup,
 			 q->guc->id + i);

@@ -116,6 +116,12 @@ enum xe_steering_type {
  * separate GTs within a tile.
  */
 struct xe_gt {
+#if IS_ENABLED(CONFIG_PERF_EVENTS)
+	/** @vf_pmu_busy: Cumulative saved VF context ticks by engine class. */
+	atomic64_t vf_pmu_busy[XE_ENGINE_CLASS_MAX];
+	/** @vf_pmu_engines: Number of user-visible engines by class. */
+	u8 vf_pmu_engines[XE_ENGINE_CLASS_MAX];
+#endif
 	/** @tile: Backpointer to GT's tile */
 	struct xe_tile *tile;
 

@@ -4,7 +4,7 @@ The i915 VF driver exposes a software PMU by default using the same context
 runtime counters as its existing DRM fdinfo interface. It requires only a
 patched **guest** driver. The host can keep the original i915-sriov-dkms driver
 and firmware; no PF changes, new GuC actions, or PF/VF relay protocol are used.
-The option is enabled by default and has no effect on the PF or xe driver.
+The i915 option applies only to i915 VFs.
 
 This is a software view of guest context runtime, not a hardware PMU. It does
 not restore access to the firmware statistics that GuC denies to a VF.
@@ -121,3 +121,37 @@ To disable the software PMU and restore the original VF behavior, set
 `i915.enable_vf_pmu=0` in the guest's kernel command line or
 `options i915 enable_vf_pmu=0` in its modprobe configuration. Update the
 bootloader configuration and initramfs as appropriate, then reboot the guest.
+
+## Xe VF software PMU
+
+The Xe VF software PMU is disabled by default. To enable it, set
+`xe.enable_vf_pmu=1` on the guest kernel command line or
+`options xe enable_vf_pmu=1` in the guest modprobe configuration. The guest
+kernel must have `CONFIG_PERF_EVENTS` enabled, and Xe must have the GT reference
+clock. The existing host driver and GuC firmware can provide the normal VF
+initialization and clock information.
+
+For a guest bound to Xe at PCI address `0000:09:00.0`, read the render class
+with the standard Xe event format:
+
+```sh
+pmu=xe_0000_09_00.0
+cat /sys/bus/event_source/devices/$pmu/caps/software
+cat /sys/bus/event_source/devices/$pmu/caps/busy_aggregation
+sudo perf stat -a -I 1000 \
+    -e "{$pmu/engine-active-ticks,gt=0,engine_class=0,engine_instance=0/,$pmu/engine-total-ticks,gt=0,engine_class=0,engine_instance=0/}"
+```
+
+Calculate utilization as `100 * delta(active_ticks) / delta(total_ticks)`.
+Active ticks sum saved guest context runtime and divide by the visible engine
+count in that class on the selected GT. All instances in a class return the
+same average. Total ticks measure guest monotonic time in GT reference clock
+ticks. The software PMU exposes these two engine events for the local VF
+(`function=0`). Xe-aware tools that open both events for every engine can use
+the counters directly.
+
+Xe samples saved context timestamps about every 20 ms while a perf event is
+open, and collects the last saved timestamp on queue teardown. Samples may
+arrive in bursts when a context stays resident for a long time. Compare idle
+and active intervals over at least 500 ms. Use a tool with a Xe backend for
+this PMU.

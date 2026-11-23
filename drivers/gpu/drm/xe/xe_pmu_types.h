@@ -7,7 +7,8 @@
 #define _XE_PMU_TYPES_H_
 
 #include <linux/perf_event.h>
-#include <linux/spinlock_types.h>
+#include <linux/mutex.h>
+#include <linux/workqueue.h>
 
 #define XE_PMU_MAX_GT 2
 
@@ -34,6 +35,14 @@ struct xe_pmu {
 	 * @supported_events: Bitmap of supported events, indexed by event id
 	 */
 	u64 supported_events;
+	/** @software: Use guest context runtime instead of GuC activity counters. */
+	bool software;
+	/** @vf_lock: Serializes sampler start, stop and unregister. */
+	struct mutex vf_lock;
+	/** @vf_users: Number of open software PMU events. */
+	unsigned int vf_users;
+	/** @vf_work: Samples saved VF context timestamps. */
+	struct delayed_work vf_work;
 };
 
 #endif

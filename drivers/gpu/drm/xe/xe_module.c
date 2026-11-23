@@ -88,6 +88,9 @@ MODULE_PARM_DESC(wedged_mode,
 module_param_named_unsafe(xelp_enable_ccs, xe_modparam.xelp_enable_ccs, bool, 0400);
 MODULE_PARM_DESC(xelp_enable_ccs, "Enable experimental CCS on Xe_LP platforms (default: true)");
 
+module_param_named(enable_vf_pmu, xe_modparam.enable_vf_pmu, bool, 0400);
+MODULE_PARM_DESC(enable_vf_pmu, "Enable the software PMU on SR-IOV VFs (default: false)");
+
 static int xe_check_nomodeset(void)
 {
 	if (drm_firmware_drivers_only())

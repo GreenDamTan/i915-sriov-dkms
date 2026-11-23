@@ -4,14 +4,22 @@
  */
 
 #include <drm/drm_drv.h>
+#include <drm/drm_managed.h>
 #include <linux/device.h>
+#include <linux/math64.h>
 
+#include "regs/xe_lrc_layout.h"
 #include "xe_device.h"
+#include "xe_exec_queue.h"
 #include "xe_force_wake.h"
+#include "xe_gt.h"
 #include "xe_gt_idle.h"
 #include "xe_guc_engine_activity.h"
+#include "xe_guc_exec_queue_types.h"
 #include "xe_guc_pc.h"
 #include "xe_hw_engine.h"
+#include "xe_lrc.h"
+#include "xe_module.h"
 #include "xe_pm.h"
 #include "xe_pmu.h"
 #include "xe_sriov_pf_helpers.h"
@@ -88,6 +96,123 @@ static unsigned int config_to_gt_id(u64 config)
 #define XE_PMU_EVENT_GT_ACTUAL_FREQUENCY	0x04
 #define XE_PMU_EVENT_GT_REQUESTED_FREQUENCY	0x05
 
+#define XE_PMU_VF_SAMPLE_MS			20
+
+static void vf_account_queue(struct xe_exec_queue *q)
+{
+	struct xe_gt *gt = q->gt;
+	u64 ticks = 0;
+	int i;
+
+	lockdep_assert_held(&gt->uc.guc.submission_state.lock);
+	if (!gt->vf_pmu_engines[q->class] || xe_hw_engine_is_reserved(q->hwe))
+		return;
+
+	/* The queue can be visible in the lookup before its LRCs are installed. */
+	scoped_guard(spinlock, &q->lrc_lookup_lock) {
+		for (i = 0; i < q->width; i++) {
+			struct xe_lrc *lrc = q->lrc[i];
+			u32 timestamp;
+			s32 delta;
+
+			if (!lrc)
+				continue;
+
+			/* The low word allows an atomic read and modular wrap handling. */
+			timestamp = xe_lrc_read_ctx_reg(lrc, CTX_TIMESTAMP);
+			delta = timestamp - lrc->vf_pmu_timestamp;
+			lrc->vf_pmu_timestamp = timestamp;
+			if (delta > 0)
+				ticks += delta;
+		}
+	}
+
+	if (ticks)
+		atomic64_add(ticks, &gt->vf_pmu_busy[q->class]);
+}
+
+/**
+ * xe_pmu_vf_queue_fini() - Account a VF queue before it leaves the GuC lookup
+ * @q: exec queue being removed, with the GuC submission mutex held
+ */
+void xe_pmu_vf_queue_fini(struct xe_exec_queue *q)
+{
+	struct xe_device *xe = gt_to_xe(q->gt);
+	int idx;
+
+	if (!smp_load_acquire(&xe->pmu.registered) || !xe->pmu.software ||
+	    !drm_dev_enter(&xe->drm, &idx))
+		return;
+
+	vf_account_queue(q);
+
+	drm_dev_exit(idx);
+}
+
+static void vf_sample(struct xe_device *xe)
+{
+	struct xe_gt *gt;
+	int idx;
+	u8 id;
+
+	if (!drm_dev_enter(&xe->drm, &idx))
+		return;
+
+	for_each_gt(gt, xe, id) {
+		struct xe_guc *guc = &gt->uc.guc;
+		struct xe_exec_queue *q;
+		unsigned long index;
+
+		if (!gt->info.reference_clock || !guc->submission_state.initialized)
+			continue;
+
+		mutex_lock(&guc->submission_state.lock);
+		xa_for_each(&guc->submission_state.exec_queue_lookup, index, q) {
+			/* Parallel queues appear at every GuC ID in their range. */
+			if (q->guc->id == index)
+				vf_account_queue(q);
+		}
+		mutex_unlock(&guc->submission_state.lock);
+	}
+
+	drm_dev_exit(idx);
+}
+
+static void vf_work(struct work_struct *work)
+{
+	struct xe_pmu *pmu = container_of(to_delayed_work(work), typeof(*pmu), vf_work);
+	struct xe_device *xe = container_of(pmu, typeof(*xe), pmu);
+
+	vf_sample(xe);
+	queue_delayed_work(system_freezable_wq, &pmu->vf_work,
+			   msecs_to_jiffies(XE_PMU_VF_SAMPLE_MS));
+}
+
+static bool vf_sampler_get(struct xe_device *xe)
+{
+	struct xe_pmu *pmu = &xe->pmu;
+
+	guard(mutex)(&pmu->vf_lock);
+	if (!READ_ONCE(pmu->registered))
+		return false;
+
+	if (!pmu->vf_users++) {
+		/* Settle old runtime before perf snapshots the first event. */
+		vf_sample(xe);
+		queue_delayed_work(system_freezable_wq, &pmu->vf_work,
+				   msecs_to_jiffies(XE_PMU_VF_SAMPLE_MS));
+	}
+
+	return true;
+}
+
+static void vf_sampler_put(struct xe_pmu *pmu)
+{
+	guard(mutex)(&pmu->vf_lock);
+	if (!--pmu->vf_users)
+		cancel_delayed_work_sync(&pmu->vf_work);
+}
+
 static struct xe_gt *event_to_gt(struct perf_event *event)
 {
 	struct xe_device *xe = container_of(event->pmu, typeof(*xe), pmu.base);
@@ -163,7 +288,7 @@ static bool event_supported(struct xe_pmu *pmu, unsigned int gt_id,
 	struct xe_device *xe = container_of(pmu, typeof(*xe), pmu);
 	struct xe_gt *gt = xe_device_get_gt(xe, gt_id);
 
-	if (!gt)
+	if (!gt || (pmu->software && !gt->info.reference_clock))
 		return false;
 
 	return id < sizeof(pmu->supported_events) * BITS_PER_BYTE &&
@@ -175,6 +300,7 @@ static bool event_param_valid(struct perf_event *event)
 	struct xe_device *xe = container_of(event->pmu, typeof(*xe), pmu.base);
 	unsigned int engine_class, engine_instance, function_id;
 	u64 config = event->attr.config;
+	struct xe_hw_engine *hwe;
 	struct xe_gt *gt;
 
 	gt = xe_device_get_gt(xe, config_to_gt_id(config));
@@ -194,7 +320,8 @@ static bool event_param_valid(struct perf_event *event)
 		break;
 	case XE_PMU_EVENT_ENGINE_ACTIVE_TICKS:
 	case XE_PMU_EVENT_ENGINE_TOTAL_TICKS:
-		if (!event_to_hwe(event))
+		hwe = event_to_hwe(event);
+		if (!hwe || (xe->pmu.software && !gt->vf_pmu_engines[hwe->class]))
 			return false;
 
 		/* PF(0) and total vfs when SRIOV is enabled */
@@ -225,7 +352,10 @@ static void xe_pmu_event_destroy(struct perf_event *event)
 	}
 
 	drm_WARN_ON(&xe->drm, event->parent);
-	xe_pm_runtime_put(xe);
+	if (xe->pmu.software)
+		vf_sampler_put(&xe->pmu);
+	else
+		xe_pm_runtime_put(xe);
 	drm_dev_put(&xe->drm);
 }
 
@@ -235,7 +365,7 @@ static int xe_pmu_event_init(struct perf_event *event)
 	struct xe_pmu *pmu = &xe->pmu;
 	unsigned int id, gt;
 
-	if (!pmu->registered)
+	if (!READ_ONCE(pmu->registered))
 		return -ENODEV;
 
 	if (event->attr.type != event->pmu->type)
@@ -260,10 +390,18 @@ static int xe_pmu_event_init(struct perf_event *event)
 		return -ENOENT;
 
 	if (!event->parent) {
+		bool ready;
+
 		drm_dev_get(&xe->drm);
-		xe_pm_runtime_get(xe);
-		if (!event_gt_forcewake(event)) {
-			xe_pm_runtime_put(xe);
+		if (pmu->software) {
+			ready = vf_sampler_get(xe);
+		} else {
+			xe_pm_runtime_get(xe);
+			ready = event_gt_forcewake(event);
+			if (!ready)
+				xe_pm_runtime_put(xe);
+		}
+		if (!ready) {
 			drm_dev_put(&xe->drm);
 			return -EINVAL;
 		}
@@ -283,6 +421,18 @@ static u64 read_engine_events(struct xe_gt *gt, struct perf_event *event)
 	function_id = config_to_function_id(config);
 
 	hwe = event_to_hwe(event);
+	if (gt_to_xe(gt)->pmu.software) {
+		if (!hwe)
+			return 0;
+
+		if (config_to_event_id(config) == XE_PMU_EVENT_ENGINE_TOTAL_TICKS)
+			return mul_u64_u32_div(ktime_get_ns(), gt->info.reference_clock,
+					       NSEC_PER_SEC);
+
+		return div_u64(atomic64_read(&gt->vf_pmu_busy[hwe->class]),
+			       gt->vf_pmu_engines[hwe->class]);
+	}
+
 	if (config_to_event_id(config) == XE_PMU_EVENT_ENGINE_ACTIVE_TICKS)
 		val = xe_guc_engine_activity_active_ticks(&gt->uc.guc, hwe, function_id);
 	else
@@ -338,7 +488,7 @@ static void xe_pmu_event_read(struct perf_event *event)
 	struct xe_device *xe = container_of(event->pmu, typeof(*xe), pmu.base);
 	struct xe_pmu *pmu = &xe->pmu;
 
-	if (!pmu->registered) {
+	if (!READ_ONCE(pmu->registered)) {
 		event->hw.state = PERF_HES_STOPPED;
 		return;
 	}
@@ -361,7 +511,7 @@ static void xe_pmu_event_start(struct perf_event *event, int flags)
 	struct xe_device *xe = container_of(event->pmu, typeof(*xe), pmu.base);
 	struct xe_pmu *pmu = &xe->pmu;
 
-	if (!pmu->registered)
+	if (!READ_ONCE(pmu->registered))
 		return;
 
 	xe_pmu_enable(event);
@@ -373,7 +523,7 @@ static void xe_pmu_event_stop(struct perf_event *event, int flags)
 	struct xe_device *xe = container_of(event->pmu, typeof(*xe), pmu.base);
 	struct xe_pmu *pmu = &xe->pmu;
 
-	if (pmu->registered)
+	if (READ_ONCE(pmu->registered))
 		if (flags & PERF_EF_UPDATE)
 			xe_pmu_event_update(event);
 
@@ -385,7 +535,7 @@ static int xe_pmu_event_add(struct perf_event *event, int flags)
 	struct xe_device *xe = container_of(event->pmu, typeof(*xe), pmu.base);
 	struct xe_pmu *pmu = &xe->pmu;
 
-	if (!pmu->registered)
+	if (!READ_ONCE(pmu->registered))
 		return -ENODEV;
 
 	if (flags & PERF_EF_START)
@@ -449,6 +599,8 @@ static ssize_t event_attr_show(struct device *dev,
 		pmu = container_of(dev_get_drvdata(kobj_to_dev(kobj)),	\
 				   typeof(*pmu), base);			\
 									\
+		if (pmu->software)					\
+			return pmu->supported_events & BIT_ULL(id_) ? attr->mode : 0; \
 		return event_supported(pmu, 0, id_) ? attr->mode : 0;	\
 	}								\
 	static const struct attribute_group pmu_group_ ##v_ = {		\
@@ -483,6 +635,32 @@ static struct attribute *pmu_empty_event_attrs[] = {
 static const struct attribute_group pmu_events_attr_group = {
 	.name = "events",
 	.attrs = pmu_empty_event_attrs,
+};
+
+PMU_EVENT_ATTR_STRING(software, vf_software, "1");
+PMU_EVENT_ATTR_STRING(busy_aggregation, vf_busy_aggregation, "class-average");
+PMU_EVENT_ATTR_STRING(sampling_period_ms, vf_sampling_period_ms,
+		      __stringify(XE_PMU_VF_SAMPLE_MS));
+
+static struct attribute *vf_caps_attrs[] = {
+	&vf_software.attr.attr,
+	&vf_busy_aggregation.attr.attr,
+	&vf_sampling_period_ms.attr.attr,
+	NULL,
+};
+
+static umode_t vf_caps_visible(struct kobject *kobj, struct attribute *attr, int index)
+{
+	struct pmu *base = dev_get_drvdata(kobj_to_dev(kobj));
+	struct xe_pmu *pmu = container_of(base, typeof(*pmu), base);
+
+	return pmu->software ? attr->mode : 0;
+}
+
+static const struct attribute_group vf_caps_attr_group = {
+	.name = "caps",
+	.attrs = vf_caps_attrs,
+	.is_visible = vf_caps_visible,
 };
 
 static const struct attribute_group *pmu_events_attr_update[] = {
@@ -520,6 +698,29 @@ static void set_supported_events(struct xe_pmu *pmu)
 	}
 }
 
+static void vf_set_supported_events(struct xe_device *xe)
+{
+	struct xe_gt *gt;
+	u8 gt_id;
+
+	for_each_gt(gt, xe, gt_id) {
+		struct xe_hw_engine *hwe;
+		enum xe_hw_engine_id id;
+
+		if (!gt->info.reference_clock || !gt->uc.guc.submission_state.initialized)
+			continue;
+
+		for_each_hw_engine(hwe, gt, id) {
+			if (xe_hw_engine_is_reserved(hwe))
+				continue;
+
+			gt->vf_pmu_engines[hwe->class]++;
+			xe->pmu.supported_events |= BIT_ULL(XE_PMU_EVENT_ENGINE_ACTIVE_TICKS) |
+						    BIT_ULL(XE_PMU_EVENT_ENGINE_TOTAL_TICKS);
+		}
+	}
+}
+
 /**
  * xe_pmu_unregister() - Remove/cleanup PMU registration
  * @arg: Ptr to pmu
@@ -527,12 +728,17 @@ static void set_supported_events(struct xe_pmu *pmu)
 static void xe_pmu_unregister(void *arg)
 {
 	struct xe_pmu *pmu = arg;
-	struct xe_device *xe = container_of(pmu, typeof(*xe), pmu);
 
-	if (!pmu->registered)
+	if (!READ_ONCE(pmu->registered))
 		return;
 
-	pmu->registered = false;
+	if (pmu->software) {
+		guard(mutex)(&pmu->vf_lock);
+		WRITE_ONCE(pmu->registered, false);
+		cancel_delayed_work_sync(&pmu->vf_work);
+	} else {
+		WRITE_ONCE(pmu->registered, false);
+	}
 
 	perf_pmu_unregister(&pmu->base);
 	kfree(pmu->name);
@@ -552,24 +758,46 @@ int xe_pmu_register(struct xe_pmu *pmu)
 		&pmu_events_attr_group,
 		NULL
 	};
+	static const struct attribute_group *vf_attr_groups[] = {
+		&pmu_format_attr_group,
+		&pmu_events_attr_group,
+		&vf_caps_attr_group,
+		NULL
+	};
 	int ret = -ENOMEM;
 	char *name;
 
 	BUILD_BUG_ON(XE_MAX_GT_PER_TILE != XE_PMU_MAX_GT);
 
-	if (IS_SRIOV_VF(xe))
-		return 0;
+	if (IS_SRIOV_VF(xe)) {
+		if (!xe_modparam.enable_vf_pmu || !xe_device_uc_enabled(xe))
+			return 0;
+
+		pmu->software = true;
+		vf_set_supported_events(xe);
+		if (!pmu->supported_events)
+			return 0;
+
+		ret = drmm_mutex_init(&xe->drm, &pmu->vf_lock);
+		if (ret)
+			goto err;
+		INIT_DELAYED_WORK(&pmu->vf_work, vf_work);
+	} else {
+		set_supported_events(pmu);
+	}
 
 	name = kasprintf(GFP_KERNEL, "xe_%s",
 			 dev_name(xe->drm.dev));
-	if (!name)
+	if (!name) {
+		ret = -ENOMEM;
 		goto err;
+	}
 
 	/* tools/perf reserves colons as special. */
 	strreplace(name, ':', '_');
 
 	pmu->name		= name;
-	pmu->base.attr_groups	= attr_groups;
+	pmu->base.attr_groups	= pmu->software ? vf_attr_groups : attr_groups;
 	pmu->base.attr_update	= pmu_events_attr_update;
 	pmu->base.scope		= PERF_PMU_SCOPE_SYS_WIDE;
 	pmu->base.module	= THIS_MODULE;
@@ -581,19 +809,29 @@ int xe_pmu_register(struct xe_pmu *pmu)
 	pmu->base.stop		= xe_pmu_event_stop;
 	pmu->base.read		= xe_pmu_event_read;
 
-	set_supported_events(pmu);
-
 	ret = perf_pmu_register(&pmu->base, pmu->name, -1);
 	if (ret)
 		goto err_name;
 
-	pmu->registered = true;
+	smp_store_release(&pmu->registered, true);
 
-	return devm_add_action_or_reset(xe->drm.dev, xe_pmu_unregister, pmu);
+	ret = devm_add_action_or_reset(xe->drm.dev, xe_pmu_unregister, pmu);
+	if (ret)
+		goto err;
+
+	if (pmu->software)
+		drm_info(&xe->drm, "Software VF PMU enabled: class-average context runtime\n");
+
+	return 0;
 
 err_name:
 	kfree(name);
 err:
+	if (pmu->software) {
+		drm_warn(&xe->drm, "Failed to register software VF PMU (ret=%d)\n", ret);
+		return 0;
+	}
+
 	drm_err(&xe->drm, "Failed to register PMU (ret=%d)!\n", ret);
 
 	return ret;

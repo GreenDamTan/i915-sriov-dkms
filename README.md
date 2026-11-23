@@ -72,6 +72,13 @@ with no hardware frequency or RC6 data.
 To disable it, set `i915.enable_vf_pmu=0` in the guest.
 See [VF software PMU setup and limitations](docs/vf-software-pmu.md).
 
+#### Xe VF software PMU
+
+The Xe VF software PMU is disabled by default. Set `xe.enable_vf_pmu=1` in the
+guest to expose `engine-active-ticks` and `engine-total-ticks`. Each engine
+instance reports the average utilization of its class on that GT. See the
+[Xe VF setup and perf example](docs/vf-software-pmu.md#xe-vf-software-pmu).
+
 #### i915 hwmon temperature
 
 Supported physical i915 GPUs expose `temp1_input` under their PCI device's
